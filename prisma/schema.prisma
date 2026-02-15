@@ -1,0 +1,754 @@
+// ===========================================
+// WALDO - Pet Social Network Database Schema
+// ===========================================
+// Using PostgreSQL with PostGIS extension for geospatial queries
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [postgis]
+}
+
+// ===========================================
+// USER MANAGEMENT
+// ===========================================
+
+model User {
+  id                String   @id @default(uuid())
+  email             String   @unique
+  passwordHash      String?  // Null if using OAuth
+  name              String
+  username          String?  @unique
+  phone             String?
+  avatarUrl         String?
+  bio               String?
+  location          String?
+  isVerified        Boolean  @default(false)
+  isActive          Boolean  @default(true)
+  
+  // Stripe Connect for receiving reward payouts
+  stripeCustomerId  String?  @unique
+  stripeAccountId   String?  @unique
+  
+  // Push notifications
+  fcmTokens         String[] // Firebase Cloud Messaging tokens
+  
+  // Stats
+  petsFound         Int      @default(0)
+  sightingsReported Int      @default(0)
+  totalEarned       Decimal  @default(0) @db.Decimal(10, 2)
+  
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  
+  // Relations
+  pets              Pet[]
+  lostPetReports    LostPetReport[]
+  sightings         Sighting[]
+  sentMessages      Message[]      @relation("SentMessages")
+  receivedMessages  Message[]      @relation("ReceivedMessages")
+  notifications     Notification[]
+  rewardClaims      RewardClaim[]
+  
+  // Meetups
+  hostedMeetups     Meetup[]       @relation("MeetupHost")
+  meetupAttendees   MeetupAttendee[]
+  
+  // Community
+  posts             Post[]
+  comments          Comment[]
+  postLikes         PostLike[]
+  
+  // Following system
+  following         Follow[]       @relation("Following")
+  followers         Follow[]       @relation("Followers")
+  
+  @@index([email])
+  @@index([username])
+  @@index([stripeCustomerId])
+}
+
+model Session {
+  id           String   @id @default(uuid())
+  userId       String
+  refreshToken String   @unique
+  userAgent    String?
+  ipAddress    String?
+  expiresAt    DateTime
+  createdAt    DateTime @default(now())
+  
+  @@index([userId])
+  @@index([refreshToken])
+}
+
+// ===========================================
+// PET PROFILES (Up to 5 per user)
+// ===========================================
+
+model Pet {
+  id              String    @id @default(uuid())
+  ownerId         String
+  owner           User      @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  
+  // Basic info
+  name            String
+  species         PetSpecies @default(DOG)
+  breed           String?
+  color           String?
+  size            PetSize?
+  age             String?
+  gender          PetGender?
+  birthday        DateTime?
+  
+  // Profile
+  bio             String?
+  photos          String[]  // Array of S3 URLs
+  profilePhoto    String?   // Main profile photo
+  
+  // Health & details
+  isNeutered      Boolean?
+  microchipId     String?
+  specialNeeds    String?
+  
+  // Social stats
+  friendsCount    Int       @default(0)
+  
+  isActive        Boolean   @default(true)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  
+  // Relations
+  lostReports     LostPetReport[]
+  meetupAttendees MeetupAttendee[]
+  
+  // Pet friendships
+  friendshipsInitiated PetFriendship[] @relation("FriendshipInitiator")
+  friendshipsReceived  PetFriendship[] @relation("FriendshipReceiver")
+  
+  @@index([ownerId])
+  @@index([species])
+}
+
+enum PetSpecies {
+  DOG
+  CAT
+  BIRD
+  RABBIT
+  OTHER
+}
+
+enum PetSize {
+  SMALL
+  MEDIUM
+  LARGE
+  EXTRA_LARGE
+}
+
+enum PetGender {
+  MALE
+  FEMALE
+  UNKNOWN
+}
+
+// Pet friendships (like Facebook friends)
+model PetFriendship {
+  id          String              @id @default(uuid())
+  petId       String
+  pet         Pet                 @relation("FriendshipInitiator", fields: [petId], references: [id], onDelete: Cascade)
+  friendId    String
+  friend      Pet                 @relation("FriendshipReceiver", fields: [friendId], references: [id], onDelete: Cascade)
+  status      FriendshipStatus    @default(PENDING)
+  createdAt   DateTime            @default(now())
+  
+  @@unique([petId, friendId])
+  @@index([petId])
+  @@index([friendId])
+}
+
+enum FriendshipStatus {
+  PENDING
+  ACCEPTED
+  BLOCKED
+}
+
+// User following (for community posts)
+model Follow {
+  id          String   @id @default(uuid())
+  followerId  String
+  follower    User     @relation("Following", fields: [followerId], references: [id], onDelete: Cascade)
+  followingId String
+  following   User     @relation("Followers", fields: [followingId], references: [id], onDelete: Cascade)
+  createdAt   DateTime @default(now())
+  
+  @@unique([followerId, followingId])
+  @@index([followerId])
+  @@index([followingId])
+}
+
+// ===========================================
+// LOST & FOUND
+// ===========================================
+
+model LostPetReport {
+  id              String    @id @default(uuid())
+  ownerId         String
+  owner           User      @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  petId           String?   // Link to existing pet profile (optional)
+  pet             Pet?      @relation(fields: [petId], references: [id], onDelete: SetNull)
+  
+  // Pet info (can override pet profile or for unregistered pets)
+  petName         String
+  species         PetSpecies @default(DOG)
+  breed           String?
+  color           String?
+  size            PetSize?
+  gender          PetGender?
+  description     String
+  distinguishingFeatures String?
+  collarInfo      String?
+  microchipId     String?
+  
+  // Photos
+  photos          String[]
+  
+  // Location (PostGIS point)
+  lastSeenLocation    Unsupported("geography(Point, 4326)")
+  lastSeenAddress     String
+  lastSeenDate        DateTime
+  
+  // Status
+  status          LostPetStatus @default(LOST)
+  foundDate       DateTime?
+  
+  // Reward (renamed from bounty)
+  rewardAmount    Decimal?      @db.Decimal(10, 2)
+  rewardEscrowed  Boolean       @default(false)
+  stripePaymentIntentId String?
+  
+  // Contact preferences
+  contactPhone    String?
+  contactEmail    String?
+  
+  // Metrics
+  viewCount       Int           @default(0)
+  shareCount      Int           @default(0)
+  
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  
+  // Relations
+  sightings       Sighting[]
+  messages        Message[]
+  rewardClaims    RewardClaim[]
+  
+  @@index([ownerId])
+  @@index([petId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+enum LostPetStatus {
+  LOST
+  FOUND
+  REUNITED
+  CLOSED
+}
+
+model Sighting {
+  id              String        @id @default(uuid())
+  lostPetReportId String
+  lostPetReport   LostPetReport @relation(fields: [lostPetReportId], references: [id], onDelete: Cascade)
+  reporterId      String?
+  reporter        User?         @relation(fields: [reporterId], references: [id], onDelete: SetNull)
+  
+  // Location (PostGIS point)
+  location        Unsupported("geography(Point, 4326)")
+  address         String
+  
+  // Details
+  description     String?
+  photoUrl        String?
+  
+  // Verification
+  isVerified      Boolean  @default(false)
+  verifiedAt      DateTime?
+  
+  // Direction/movement
+  headingDirection String?
+  
+  createdAt       DateTime @default(now())
+  
+  @@index([lostPetReportId])
+  @@index([reporterId])
+  @@index([createdAt])
+}
+
+model RewardClaim {
+  id              String            @id @default(uuid())
+  lostPetReportId String
+  lostPetReport   LostPetReport     @relation(fields: [lostPetReportId], references: [id], onDelete: Cascade)
+  claimantId      String
+  claimant        User              @relation(fields: [claimantId], references: [id], onDelete: Cascade)
+  
+  // Claim details
+  currentLocation String
+  contactPhone    String
+  photoProofUrl   String?
+  notes           String?
+  
+  // Status
+  status          RewardClaimStatus @default(PENDING)
+  
+  // Payment
+  stripeTransferId String?
+  paidAmount       Decimal?         @db.Decimal(10, 2)
+  paidAt           DateTime?
+  
+  // Verification meeting
+  meetingScheduled DateTime?
+  meetingLocation  String?
+  
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  
+  @@index([lostPetReportId])
+  @@index([claimantId])
+  @@index([status])
+}
+
+enum RewardClaimStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  PAID
+  CANCELLED
+}
+
+// ===========================================
+// MEETUPS (Playdates, Group Walks, Events)
+// ===========================================
+
+model Meetup {
+  id              String      @id @default(uuid())
+  hostId          String
+  host            User        @relation("MeetupHost", fields: [hostId], references: [id], onDelete: Cascade)
+  
+  // Event details
+  title           String
+  description     String?
+  type            MeetupType
+  
+  // Location (PostGIS point)
+  location        Unsupported("geography(Point, 4326)")
+  address         String
+  venueName       String?
+  
+  // Timing
+  startTime       DateTime
+  endTime         DateTime?
+  
+  // Capacity
+  maxAttendees    Int?
+  
+  // Pet requirements
+  allowedSpecies  PetSpecies[]
+  allowedSizes    PetSize[]
+  
+  // Settings
+  isPublic        Boolean     @default(true)
+  requiresApproval Boolean    @default(false)
+  
+  // Status
+  status          MeetupStatus @default(UPCOMING)
+  
+  // Metrics
+  viewCount       Int         @default(0)
+  
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  
+  // Relations
+  attendees       MeetupAttendee[]
+  
+  @@index([hostId])
+  @@index([type])
+  @@index([status])
+  @@index([startTime])
+}
+
+enum MeetupType {
+  PLAYDATE
+  GROUP_WALK
+  PET_EVENT
+  TRAINING_SESSION
+  OTHER
+}
+
+enum MeetupStatus {
+  UPCOMING
+  ONGOING
+  COMPLETED
+  CANCELLED
+}
+
+model MeetupAttendee {
+  id        String         @id @default(uuid())
+  meetupId  String
+  meetup    Meetup         @relation(fields: [meetupId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  petId     String?
+  pet       Pet?           @relation(fields: [petId], references: [id], onDelete: SetNull)
+  
+  status    AttendeeStatus @default(GOING)
+  
+  createdAt DateTime       @default(now())
+  
+  @@unique([meetupId, userId])
+  @@index([meetupId])
+  @@index([userId])
+}
+
+enum AttendeeStatus {
+  GOING
+  MAYBE
+  NOT_GOING
+  WAITLIST
+}
+
+// ===========================================
+// COMMUNITY (Advice, Discussions)
+// ===========================================
+
+model Post {
+  id          String    @id @default(uuid())
+  authorId    String
+  author      User      @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  
+  // Content
+  content     String
+  images      String[]
+  
+  // Categorization
+  category    PostCategory
+  tags        String[]
+  
+  // Metrics
+  likesCount  Int       @default(0)
+  commentsCount Int     @default(0)
+  
+  // Settings
+  isPublic    Boolean   @default(true)
+  isPinned    Boolean   @default(false)
+  
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  
+  // Relations
+  comments    Comment[]
+  likes       PostLike[]
+  
+  @@index([authorId])
+  @@index([category])
+  @@index([createdAt])
+}
+
+enum PostCategory {
+  GENERAL
+  ADVICE
+  QUESTION
+  HEALTH
+  TRAINING
+  NUTRITION
+  GROOMING
+  BEHAVIOR
+  PRODUCT_REVIEW
+  STORY
+}
+
+model Comment {
+  id        String   @id @default(uuid())
+  postId    String
+  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+  authorId  String
+  author    User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  
+  // For nested comments
+  parentId  String?
+  parent    Comment? @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies   Comment[] @relation("CommentReplies")
+  
+  content   String
+  
+  likesCount Int     @default(0)
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([postId])
+  @@index([authorId])
+  @@index([parentId])
+}
+
+model PostLike {
+  id        String   @id @default(uuid())
+  postId    String
+  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  createdAt DateTime @default(now())
+  
+  @@unique([postId, userId])
+  @@index([postId])
+  @@index([userId])
+}
+
+// ===========================================
+// MARKETPLACE (Verified Businesses/Shelters)
+// ===========================================
+
+model Business {
+  id              String        @id @default(uuid())
+  
+  // Business info
+  name            String
+  type            BusinessType
+  description     String?
+  
+  // Contact
+  email           String        @unique
+  phone           String?
+  website         String?
+  
+  // Location (PostGIS point)
+  location        Unsupported("geography(Point, 4326)")?
+  address         String?
+  
+  // Media
+  logoUrl         String?
+  coverPhotoUrl   String?
+  photos          String[]
+  
+  // Verification
+  isVerified      Boolean       @default(false)
+  verifiedAt      DateTime?
+  verificationDocs String[]
+  
+  // Operating hours (JSON)
+  operatingHours  Json?
+  
+  // Stats
+  listingsCount   Int           @default(0)
+  rating          Decimal?      @db.Decimal(2, 1)
+  reviewsCount    Int           @default(0)
+  
+  isActive        Boolean       @default(true)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  
+  // Relations
+  listings        MarketplaceListing[]
+  
+  @@index([type])
+  @@index([isVerified])
+}
+
+enum BusinessType {
+  PET_STORE
+  SHELTER
+  RESCUE
+  BREEDER
+  VETERINARY
+  GROOMING
+  TRAINING
+  NONPROFIT
+  OTHER
+}
+
+model MarketplaceListing {
+  id              String          @id @default(uuid())
+  businessId      String
+  business        Business        @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  
+  // Pet info
+  name            String
+  species         PetSpecies
+  breed           String?
+  color           String?
+  size            PetSize?
+  age             String?
+  gender          PetGender?
+  description     String
+  
+  // Photos
+  photos          String[]
+  
+  // Pricing
+  price           Decimal?        @db.Decimal(10, 2)
+  adoptionFee     Decimal?        @db.Decimal(10, 2)
+  isFree          Boolean         @default(false)
+  
+  // Health info
+  isVaccinated    Boolean?
+  isNeutered      Boolean?
+  healthNotes     String?
+  
+  // Status
+  status          ListingStatus   @default(AVAILABLE)
+  
+  // Metrics
+  viewCount       Int             @default(0)
+  inquiryCount    Int             @default(0)
+  
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  
+  @@index([businessId])
+  @@index([species])
+  @@index([status])
+  @@index([createdAt])
+}
+
+enum ListingStatus {
+  AVAILABLE
+  PENDING
+  ADOPTED
+  SOLD
+  REMOVED
+}
+
+// ===========================================
+// MESSAGING
+// ===========================================
+
+model Message {
+  id              String         @id @default(uuid())
+  senderId        String
+  sender          User           @relation("SentMessages", fields: [senderId], references: [id], onDelete: Cascade)
+  receiverId      String
+  receiver        User           @relation("ReceivedMessages", fields: [receiverId], references: [id], onDelete: Cascade)
+  
+  // Context (what the message is about)
+  lostPetReportId String?
+  lostPetReport   LostPetReport? @relation(fields: [lostPetReportId], references: [id], onDelete: SetNull)
+  
+  content         String
+  images          String[]
+  
+  isRead          Boolean        @default(false)
+  readAt          DateTime?
+  
+  createdAt       DateTime       @default(now())
+  
+  @@index([senderId])
+  @@index([receiverId])
+  @@index([lostPetReportId])
+  @@index([createdAt])
+}
+
+// ===========================================
+// NOTIFICATIONS
+// ===========================================
+
+model Notification {
+  id        String           @id @default(uuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  type      NotificationType
+  title     String
+  message   String
+  data      Json?
+  
+  isRead    Boolean          @default(false)
+  readAt    DateTime?
+  
+  createdAt DateTime         @default(now())
+  
+  @@index([userId])
+  @@index([isRead])
+  @@index([createdAt])
+}
+
+enum NotificationType {
+  // Lost & Found
+  SIGHTING
+  REWARD_ESCROWED
+  REWARD_CLAIMED
+  REWARD_RELEASED
+  REWARD_REFUNDED
+  PET_FOUND
+  
+  // Social
+  NEW_FOLLOWER
+  FRIEND_REQUEST
+  FRIEND_ACCEPTED
+  
+  // Meetups
+  MEETUP_INVITE
+  MEETUP_REMINDER
+  MEETUP_CANCELLED
+  MEETUP_UPDATED
+  
+  // Community
+  POST_LIKE
+  POST_COMMENT
+  COMMENT_REPLY
+  
+  // Marketplace
+  LISTING_INQUIRY
+  
+  // General
+  MESSAGE
+  SYSTEM
+}
+
+// ===========================================
+// PAYMENT TRANSACTIONS
+// ===========================================
+
+model Transaction {
+  id                    String            @id @default(uuid())
+  userId                String
+  type                  TransactionType
+  amount                Decimal           @db.Decimal(10, 2)
+  fee                   Decimal           @default(0) @db.Decimal(10, 2)
+  netAmount             Decimal           @db.Decimal(10, 2)
+  
+  // Stripe references
+  stripePaymentIntentId String?
+  stripeTransferId      String?
+  stripeRefundId        String?
+  
+  // Related entities
+  lostPetReportId       String?
+  rewardClaimId         String?
+  
+  status                TransactionStatus @default(PENDING)
+  description           String?
+  
+  createdAt             DateTime          @default(now())
+  
+  @@index([userId])
+  @@index([stripePaymentIntentId])
+}
+
+enum TransactionType {
+  REWARD_ESCROW
+  REWARD_PAYOUT
+  REWARD_REFUND
+  PLATFORM_FEE
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REFUNDED
+}
